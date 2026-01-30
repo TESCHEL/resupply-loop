@@ -1,11 +1,10 @@
 'use client'
 import { useState, useEffect } from 'react'
 import Link from 'next/link'
-import { useAccount, useConnect, useDisconnect, useWriteContract, useWaitForTransactionReceipt, useReadContract } from 'wagmi'
-import { parseUnits, formatUnits } from 'viem'
+import { useAccount, useConnect, useDisconnect, useWriteContract, useWaitForTransactionReceipt, useReadContract, useGasPrice } from 'wagmi'
+import { parseUnits, formatUnits, maxUint256 } from 'viem'
 import { injected } from 'wagmi/connectors'
 
-// Contract addresses (Ethereum Mainnet)
 const ADDRESSES = {
   crvUSD: '0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E' as const,
   reUSD: '0x57aB1E0003F623289CD798B1824Be09a793e4Bec' as const,
@@ -13,7 +12,13 @@ const ADDRESSES = {
   curveLendMarket: '0x4F79Fe450a2BAF833E8f50340BD230f5A3eCaFe9' as const,
 }
 
-// Minimal ABIs for the operations we need
+const GAS_LIMITS = {
+  approve: 65000n,
+  deposit: 250000n,
+  createLoan: 500000n,
+  borrowMore: 400000n,
+}
+
 const ERC20_ABI = [
   {
     name: 'approve',
@@ -38,7 +43,6 @@ const ERC20_ABI = [
   },
 ] as const
 
-// Resupply minter ABI (deposit crvUSD -> mint reUSD)
 const RESUPPLY_MINTER_ABI = [
   {
     name: 'deposit',
@@ -49,7 +53,6 @@ const RESUPPLY_MINTER_ABI = [
   },
 ] as const
 
-// ERC4626 vault ABI (sreUSD vault)
 const VAULT_ABI = [
   {
     name: 'deposit',
@@ -60,7 +63,6 @@ const VAULT_ABI = [
   },
 ] as const
 
-// Curve Lend market ABI (borrow crvUSD against sreUSD collateral)
 const CURVE_LEND_ABI = [
   {
     name: 'create_loan',
@@ -96,24 +98,51 @@ type LoopStep =
   | 'complete'
 
 export default function AppPage() {
+  const [mounted, setMounted] = useState(false)
   const [amount, setAmount] = useState('')
   const [leverage, setLeverage] = useState(2)
   const [currentStep, setCurrentStep] = useState<LoopStep>('idle')
   const [loopIteration, setLoopIteration] = useState(0)
   const [error, setError] = useState<string | null>(null)
+  const [estimatedGas, setEstimatedGas] = useState<string | null>(null)
+
+  useEffect(() => {
+    setMounted(true)
+  }, [])
 
   const { address, isConnected } = useAccount()
   const { connect } = useConnect()
   const { disconnect } = useDisconnect()
   const { writeContract, data: txHash, isPending } = useWriteContract()
   const { isLoading: isTxLoading, isSuccess: isTxSuccess } = useWaitForTransactionReceipt({ hash: txHash })
+  const { data: gasPrice } = useGasPrice()
 
-  // Read crvUSD balance
   const { data: crvUSDBalance } = useReadContract({
     address: ADDRESSES.crvUSD,
     abi: ERC20_ABI,
     functionName: 'balanceOf',
     args: address ? [address] : undefined,
+  })
+
+  const { data: crvUSDAllowance } = useReadContract({
+    address: ADDRESSES.crvUSD,
+    abi: ERC20_ABI,
+    functionName: 'allowance',
+    args: address ? [address, ADDRESSES.reUSD] : undefined,
+  })
+
+  const { data: reUSDAllowance } = useReadContract({
+    address: ADDRESSES.reUSD,
+    abi: ERC20_ABI,
+    functionName: 'allowance',
+    args: address ? [address, ADDRESSES.sreUSD] : undefined,
+  })
+
+  const { data: sreUSDAllowance } = useReadContract({
+    address: ADDRESSES.sreUSD,
+    abi: ERC20_ABI,
+    functionName: 'allowance',
+    args: address ? [address, ADDRESSES.curveLendMarket] : undefined,
   })
 
   const numAmount = parseFloat(amount) || 0
@@ -122,9 +151,42 @@ export default function AppPage() {
   const borrowCost = 2.1
   const netApy = baseApy * leverage - borrowCost * (leverage - 1)
   const healthFactor = leverage > 0 ? (4 / leverage).toFixed(2) : '4.00'
-
-  // Calculate borrow amount based on ~80% LTV (conservative)
   const borrowRatio = 0.80
+
+  const LARGE_ALLOWANCE_THRESHOLD = BigInt(10) ** BigInt(30)
+  
+  const hasCrvUSDApproval = crvUSDAllowance && crvUSDAllowance >= LARGE_ALLOWANCE_THRESHOLD
+  const hasReUSDApproval = reUSDAllowance && reUSDAllowance >= LARGE_ALLOWANCE_THRESHOLD
+  const hasSreUSDApproval = sreUSDAllowance && sreUSDAllowance >= LARGE_ALLOWANCE_THRESHOLD
+
+  useEffect(() => {
+    if (!gasPrice || numAmount <= 0) {
+      setEstimatedGas(null)
+      return
+    }
+
+    let totalGas = 0n
+
+    if (!hasCrvUSDApproval) {
+      totalGas += GAS_LIMITS.approve
+    }
+    if (!hasReUSDApproval) {
+      totalGas += GAS_LIMITS.approve
+    }
+    if (!hasSreUSDApproval) {
+      totalGas += GAS_LIMITS.approve
+    }
+
+    for (let i = 0; i < leverage; i++) {
+      totalGas += GAS_LIMITS.deposit
+      totalGas += GAS_LIMITS.deposit
+      totalGas += i === 0 ? GAS_LIMITS.createLoan : GAS_LIMITS.borrowMore
+    }
+
+    const estimatedCostWei = totalGas * gasPrice
+    const estimatedCostEth = formatUnits(estimatedCostWei, 18)
+    setEstimatedGas(parseFloat(estimatedCostEth).toFixed(6))
+  }, [gasPrice, numAmount, leverage, hasCrvUSDApproval, hasReUSDApproval, hasSreUSDApproval])
 
   const handleConnect = () => {
     connect({ connector: injected() })
@@ -134,30 +196,39 @@ export default function AppPage() {
     disconnect()
   }
 
-  // Execute the loop
   const executeLoop = async () => {
     if (!address || numAmount <= 0) return
     setError(null)
     setLoopIteration(1)
     
     try {
-      // Step 1: Approve crvUSD for Resupply minter (reUSD contract)
-      setCurrentStep('approve-crvusd')
       const amountWei = parseUnits(amount, 18)
-      
-      writeContract({
-        address: ADDRESSES.crvUSD,
-        abi: ERC20_ABI,
-        functionName: 'approve',
-        args: [ADDRESSES.reUSD, amountWei * BigInt(leverage)], // Approve for all iterations
-      })
+
+      if (!hasCrvUSDApproval) {
+        setCurrentStep('approve-crvusd')
+        writeContract({
+          address: ADDRESSES.crvUSD,
+          abi: ERC20_ABI,
+          functionName: 'approve',
+          args: [ADDRESSES.reUSD, maxUint256],
+          gas: GAS_LIMITS.approve,
+        })
+      } else {
+        setCurrentStep('deposit-crvusd')
+        writeContract({
+          address: ADDRESSES.reUSD,
+          abi: RESUPPLY_MINTER_ABI,
+          functionName: 'deposit',
+          args: [amountWei, address],
+          gas: GAS_LIMITS.deposit,
+        })
+      }
     } catch (err: any) {
       setError(err.message || 'Transaction failed')
       setCurrentStep('idle')
     }
   }
 
-  // Handle transaction success and progress through steps
   useEffect(() => {
     if (!isTxSuccess || !address) return
 
@@ -168,85 +239,115 @@ export default function AppPage() {
       try {
         switch (currentStep) {
           case 'approve-crvusd':
-            // After approval, deposit crvUSD to mint reUSD
             setCurrentStep('deposit-crvusd')
             writeContract({
               address: ADDRESSES.reUSD,
               abi: RESUPPLY_MINTER_ABI,
               functionName: 'deposit',
               args: [iterationAmount, address],
+              gas: GAS_LIMITS.deposit,
             })
             break
 
           case 'deposit-crvusd':
-            // After minting reUSD, approve it for sreUSD vault
-            setCurrentStep('approve-reusd')
-            writeContract({
-              address: ADDRESSES.reUSD,
-              abi: ERC20_ABI,
-              functionName: 'approve',
-              args: [ADDRESSES.sreUSD, iterationAmount],
-            })
+            if (!hasReUSDApproval) {
+              setCurrentStep('approve-reusd')
+              writeContract({
+                address: ADDRESSES.reUSD,
+                abi: ERC20_ABI,
+                functionName: 'approve',
+                args: [ADDRESSES.sreUSD, maxUint256],
+                gas: GAS_LIMITS.approve,
+              })
+            } else {
+              setCurrentStep('deposit-reusd')
+              writeContract({
+                address: ADDRESSES.sreUSD,
+                abi: VAULT_ABI,
+                functionName: 'deposit',
+                args: [iterationAmount, address],
+                gas: GAS_LIMITS.deposit,
+              })
+            }
             break
 
           case 'approve-reusd':
-            // Deposit reUSD into sreUSD vault
             setCurrentStep('deposit-reusd')
             writeContract({
               address: ADDRESSES.sreUSD,
               abi: VAULT_ABI,
               functionName: 'deposit',
               args: [iterationAmount, address],
+              gas: GAS_LIMITS.deposit,
             })
             break
 
           case 'deposit-reusd':
-            // Approve sreUSD for Curve Lend market
-            setCurrentStep('approve-sreusd')
-            writeContract({
-              address: ADDRESSES.sreUSD,
-              abi: ERC20_ABI,
-              functionName: 'approve',
-              args: [ADDRESSES.curveLendMarket, iterationAmount],
-            })
+            if (!hasSreUSDApproval) {
+              setCurrentStep('approve-sreusd')
+              writeContract({
+                address: ADDRESSES.sreUSD,
+                abi: ERC20_ABI,
+                functionName: 'approve',
+                args: [ADDRESSES.curveLendMarket, maxUint256],
+                gas: GAS_LIMITS.approve,
+              })
+            } else {
+              setCurrentStep('borrow-crvusd')
+              const borrowAmount = iterationAmount * BigInt(Math.floor(borrowRatio * 100)) / BigInt(100)
+              if (loopIteration === 1) {
+                writeContract({
+                  address: ADDRESSES.curveLendMarket,
+                  abi: CURVE_LEND_ABI,
+                  functionName: 'create_loan',
+                  args: [iterationAmount, borrowAmount, BigInt(4)],
+                  gas: GAS_LIMITS.createLoan,
+                })
+              } else {
+                writeContract({
+                  address: ADDRESSES.curveLendMarket,
+                  abi: CURVE_LEND_ABI,
+                  functionName: 'borrow_more',
+                  args: [iterationAmount, borrowAmount],
+                  gas: GAS_LIMITS.borrowMore,
+                })
+              }
+            }
             break
 
           case 'approve-sreusd':
-            // Borrow crvUSD using sreUSD as collateral
             setCurrentStep('borrow-crvusd')
             const borrowAmount = iterationAmount * BigInt(Math.floor(borrowRatio * 100)) / BigInt(100)
-            
             if (loopIteration === 1) {
-              // First iteration: create loan
               writeContract({
                 address: ADDRESSES.curveLendMarket,
                 abi: CURVE_LEND_ABI,
                 functionName: 'create_loan',
-                args: [iterationAmount, borrowAmount, BigInt(4)], // 4 bands
+                args: [iterationAmount, borrowAmount, BigInt(4)],
+                gas: GAS_LIMITS.createLoan,
               })
             } else {
-              // Subsequent iterations: borrow more
               writeContract({
                 address: ADDRESSES.curveLendMarket,
                 abi: CURVE_LEND_ABI,
                 functionName: 'borrow_more',
                 args: [iterationAmount, borrowAmount],
+                gas: GAS_LIMITS.borrowMore,
               })
             }
             break
 
           case 'borrow-crvusd':
-            // Check if we need more iterations
             if (loopIteration < leverage) {
               setLoopIteration(prev => prev + 1)
               setCurrentStep('deposit-crvusd')
-              // Use borrowed crvUSD for next iteration
               const nextIterationAmount = iterationAmount * BigInt(Math.floor(borrowRatio * 100)) / BigInt(100)
               writeContract({
                 address: ADDRESSES.reUSD,
                 abi: RESUPPLY_MINTER_ABI,
                 functionName: 'deposit',
                 args: [nextIterationAmount, address],
+                gas: GAS_LIMITS.deposit,
               })
             } else {
               setCurrentStep('complete')
@@ -264,11 +365,11 @@ export default function AppPage() {
 
   const getStepLabel = () => {
     switch (currentStep) {
-      case 'approve-crvusd': return `Approving crvUSD (Loop ${loopIteration}/${leverage})...`
+      case 'approve-crvusd': return `Approving crvUSD (one-time)...`
       case 'deposit-crvusd': return `Depositing crvUSD to mint reUSD (Loop ${loopIteration}/${leverage})...`
-      case 'approve-reusd': return `Approving reUSD (Loop ${loopIteration}/${leverage})...`
+      case 'approve-reusd': return `Approving reUSD (one-time)...`
       case 'deposit-reusd': return `Depositing reUSD to sreUSD vault (Loop ${loopIteration}/${leverage})...`
-      case 'approve-sreusd': return `Approving sreUSD (Loop ${loopIteration}/${leverage})...`
+      case 'approve-sreusd': return `Approving sreUSD (one-time)...`
       case 'borrow-crvusd': return `Borrowing crvUSD from Curve Lend (Loop ${loopIteration}/${leverage})...`
       case 'complete': return 'Loop Complete!'
       default: return ''
@@ -279,7 +380,6 @@ export default function AppPage() {
 
   return (
     <div className="min-h-screen flex flex-col">
-      {/* Header */}
       <header className="border-b border-dark-600 px-6 py-4">
         <div className="max-w-6xl mx-auto flex items-center justify-between">
           <Link href="/" className="flex items-center gap-2">
@@ -287,7 +387,7 @@ export default function AppPage() {
             <span className="font-semibold text-lg">Resupply</span>
           </Link>
           
-          {isConnected ? (
+          {mounted && isConnected ? (
             <div className="flex items-center gap-3">
               <span className="text-sm text-gray-400">
                 {address?.slice(0, 6)}...{address?.slice(-4)}
@@ -310,17 +410,15 @@ export default function AppPage() {
         </div>
       </header>
 
-      {/* Main Content */}
       <main className="flex-1 px-6 py-12">
         <div className="max-w-lg mx-auto">
           <h1 className="text-3xl font-bold mb-2">Loop Strategy</h1>
           <p className="text-gray-400 mb-8">Amplify your yield with leveraged stablecoin positions</p>
 
-          {/* Input Card */}
           <div className="bg-dark-800 rounded-2xl p-6 mb-6">
             <div className="flex items-center justify-between mb-4">
               <span className="text-gray-400">Deposit</span>
-              {isConnected && crvUSDBalance && (
+              {mounted && isConnected && crvUSDBalance && (
                 <span className="text-sm text-gray-500">
                   Balance: {parseFloat(formatUnits(crvUSDBalance, 18)).toFixed(2)} crvUSD
                 </span>
@@ -340,7 +438,6 @@ export default function AppPage() {
               </div>
             </div>
 
-            {/* Leverage Slider */}
             <div className="mb-6">
               <div className="flex items-center justify-between mb-2">
                 <span className="text-gray-400">Leverage</span>
@@ -364,7 +461,6 @@ export default function AppPage() {
               </div>
             </div>
 
-            {/* Stats */}
             <div className="grid grid-cols-2 gap-4 p-4 bg-dark-700/50 rounded-xl mb-6">
               <div>
                 <span className="text-gray-400 text-sm">Position Size</span>
@@ -384,22 +480,36 @@ export default function AppPage() {
               </div>
             </div>
 
-            {/* Status Message */}
+            {estimatedGas && numAmount > 0 && (
+              <div className="p-4 rounded-xl mb-4 text-sm bg-dark-700/50 border border-dark-600">
+                <div className="flex items-center justify-between">
+                  <span className="text-gray-400">Estimated Gas Cost</span>
+                  <span className="font-medium text-accent-cyan">~{estimatedGas} ETH</span>
+                </div>
+                <p className="text-xs text-gray-500 mt-1">
+                  Gas limits optimized per transaction.
+                </p>
+                {(!hasCrvUSDApproval || !hasReUSDApproval || !hasSreUSDApproval) && (
+                  <p className="text-xs text-yellow-500 mt-2">
+                    This will grant unlimited token approvals for gas efficiency. You can revoke approvals later via Etherscan or Revoke.cash.
+                  </p>
+                )}
+              </div>
+            )}
+
             {currentStep !== 'idle' && (
               <div className={currentStep === 'complete' ? 'p-4 rounded-xl mb-4 text-sm bg-green-900/30 text-green-400' : 'p-4 rounded-xl mb-4 text-sm bg-blue-900/30 text-blue-400'}>
                 {getStepLabel()}
               </div>
             )}
 
-            {/* Error Message */}
             {error && (
               <div className="p-4 rounded-xl mb-4 text-sm bg-red-900/30 text-red-400">
                 {error}
               </div>
             )}
 
-            {/* Action Button */}
-            {!isConnected ? (
+            {(!mounted || !isConnected) ? (
               <button
                 onClick={handleConnect}
                 className="w-full py-4 bg-gradient-to-r from-accent-blue to-accent-purple rounded-xl font-semibold hover:opacity-90 transition-opacity"
@@ -417,7 +527,6 @@ export default function AppPage() {
             )}
           </div>
 
-          {/* Protocol Flow Info */}
           <div className="bg-dark-800 rounded-2xl p-6">
             <h3 className="font-semibold mb-4">How it works</h3>
             <div className="space-y-3 text-sm text-gray-400">
